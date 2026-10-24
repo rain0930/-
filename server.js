@@ -1,20 +1,13 @@
-// 英雄聯盟派對答題：零依賴，Node.js 18+。啟動：node server.js
-const http = require('http'), fs = require('fs'), path = require('path'), os = require('os'), crypto = require('crypto');
+// 英雄聯盟答題（單人闖關＋排行榜）：零依賴，Node.js 18+。啟動：node server.js
+const http = require('http'), fs = require('fs'), path = require('path'), os = require('os');
 const PORT = +process.env.PORT || 3000;
-const PER = +process.env.PER || 8;          // 每場題數
-const ARAM_N = +process.env.ARAM_N || 2;    // 每場 ARAM 題數
+const PER = +process.env.PER || 10;         // 每場題數
+const ARAM_N = +process.env.ARAM_N || 3;    // 每場 ARAM 題數
 const IMG_N = +process.env.IMG_N || 2;      // 每場最多圖片／影片題數
-const AUTO = process.env.AUTO !== '0';      // 自動進行（不需要主持人）；設 AUTO=0 則全部由主持人手動控制
-const QTIME = (+process.env.QTIME || 25) * 1000;  // 每題作答秒數
-const RTIME = (+process.env.RTIME || 7) * 1000;   // 公布答案後停留秒數
-const KEY = process.env.HOST_KEY || crypto.randomBytes(3).toString('hex');
 const PUB = path.join(__dirname, 'public');
 const BANK = JSON.parse(fs.readFileSync(path.join(__dirname, 'questions.json'), 'utf8')).map((q, i) => ({ id: i, ...q }));
 const isMedia = b => b.img || b.video || b.yt;
-
-let G = { phase: 'lobby', q: -1, deck: [], players: {}, deadline: 0 };
-let tm = null;
-const clients = new Set();
+const players = {};  // id → { name, state, deck, i, score, best, res:{} }
 
 const sh = a => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(x => x[1]);
 function mkDeck() {
@@ -23,10 +16,8 @@ function mkDeck() {
   const rest = sh(BANK.filter(b => b.c !== 'a' && !isMedia(b))).slice(0, Math.max(0, PER - med.length - aram.length));
   return sh([...med, ...aram, ...rest]).map(b => b.id);
 }
-const cur = () => BANK[G.deck[G.q]];
 const norm = s => String(s).trim().toLowerCase().replace(/\s+/g, '');
 function pts(q, v) {
-  if (v === undefined || !q) return 0;
   if (q.t === 'num') return Math.max(0, Math.round(1000 * (1 - Math.abs(v - q.a) / q.tol)));
   if (q.t === 'text') return q.a.some(x => norm(x) === norm(v)) ? 1000 : 0;
   if (q.t === 'order') return JSON.stringify(v) === JSON.stringify(q.a) ? 1000 : 0;
@@ -34,70 +25,50 @@ function pts(q, v) {
 }
 function valid(q, v) {
   if (q.t === 'choice' || q.t === 'tf') return Number.isInteger(v) && v >= 0 && v < q.o.length;
-  if (q.t === 'text') return typeof v === 'string' && v.length <= 40;
+  if (q.t === 'text') return typeof v === 'string' && v.trim().length > 0 && v.length <= 40;
   if (q.t === 'num') return typeof v === 'number' && isFinite(v);
   if (q.t === 'order') return Array.isArray(v) && v.length === q.a.length && [...v].sort().join('|') === [...q.a].sort().join('|');
   return false;
 }
-function total(p) {
-  const u = (G.phase === 'reveal' || G.phase === 'end') ? G.q : G.q - 1;
-  let t = 0; for (let i = 0; i <= u; i++) t += pts(BANK[G.deck[i]], p.answers[i]); return t;
+function board(me) {
+  const all = Object.entries(players);
+  return {
+    top: all.filter(([, p]) => p.best > 0 || p.played).map(([id, p]) => ({ name: p.name, s: p.best, me: id === me })).sort((a, b) => b.s - a.s).slice(0, 30),
+    playing: all.filter(([, p]) => p.state === 'play' || p.state === 'reveal').length
+  };
 }
-const board = () => Object.entries(G.players).map(([id, p]) => ({ id, name: p.name, s: total(p) })).sort((a, b) => b.s - a.s).slice(0, 30);
-
 function snap(id) {
-  const me = G.players[id];
-  const o = { phase: G.phase, q: G.q, total: G.deck.length, n: Object.keys(G.players).length, joined: !!me, auto: AUTO, left: G.deadline ? Math.max(0, G.deadline - Date.now()) : 0 };
-  if (G.phase === 'question' || G.phase === 'reveal') {
-    const q = cur(), rev = G.phase === 'reveal';
-    o.question = { t: q.t, q: q.q, o: q.o, img: q.img, video: q.video, yt: q.yt, show: q.show, c: q.c };
-    o.answered = Object.values(G.players).filter(p => p.answers[G.q] !== undefined).length;
-    if (me) o.mine = me.answers[G.q];
-    if (rev) { o.answer = q.t === 'text' ? q.a[0] : q.a; if (me) o.gain = pts(q, me.answers[G.q]); }
+  const p = players[id];
+  if (!p) return { state: 'new', board: board(id) };
+  const o = { state: p.state, name: p.name, total: p.deck.length, i: p.i, score: p.score, best: p.best, board: board(id) };
+  if (p.state === 'play' || p.state === 'reveal') {
+    const q = BANK[p.deck[p.i]];
+    const pm = p.perm[p.i]; o.question = { t: q.t, q: q.q, o: pm ? pm.map(k => q.o[k]) : q.o, img: q.img, video: q.video, yt: q.yt, show: q.show, c: q.c };
+    if (p.state === 'reveal') { const r = p.res[p.i]; o.mine = r.v; o.gain = r.g; o.answer = pm ? pm.indexOf(q.a) : (q.t === 'text' ? q.a[0] : q.a); o.exp = q.exp; }
   }
-  if (G.phase !== 'question') o.board = board();
   return o;
 }
-function broadcast() { for (const c of clients) c.res.write('data: ' + JSON.stringify(snap(c.id)) + '\n\n'); }
-
-function schedule() {
-  clearTimeout(tm); G.deadline = 0;
-  if (!AUTO) return;
-  let ms = 0;
-  if (G.phase === 'question') { const q = cur(); ms = q.time ? q.time * 1000 : (q.video || q.yt) ? 45000 : QTIME; }
-  else if (G.phase === 'reveal') ms = RTIME;
-  if (!ms) return;
-  G.deadline = Date.now() + ms;
-  tm = setTimeout(() => { next(); broadcast(); }, ms);
-}
-function next() {
-  if (G.phase === 'lobby') { if (!Object.keys(G.players).length) return false; G.deck = mkDeck(); G.q = 0; G.phase = 'question'; }
-  else if (G.phase === 'question') G.phase = 'reveal';
-  else if (G.phase === 'reveal') { if (G.q + 1 < G.deck.length) { G.q++; G.phase = 'question'; } else G.phase = 'end'; }
-  else { for (const p of Object.values(G.players)) p.answers = {}; G.phase = 'lobby'; G.q = -1; G.deck = []; }
-  schedule();
-  return true;
-}
-// 所有「在線」玩家都答完 → 提早公布答案
-function maybeReveal() {
-  if (!AUTO || G.phase !== 'question') return;
-  const online = new Set([...clients].map(c => c.id));
-  const ps = Object.entries(G.players).filter(([id]) => online.has(id));
-  if (ps.length && ps.every(([, p]) => p.answers[G.q] !== undefined)) {
-    clearTimeout(tm); G.deadline = Date.now() + 800;
-    tm = setTimeout(() => { if (G.phase === 'question') { next(); broadcast(); } }, 800);
+function act(b) {
+  const id = String(b.id || '').slice(0, 40); if (!id) return {};
+  let p = players[id];
+  if (b.type === 'join') {
+    const name = String(b.name || '').trim().slice(0, 12); if (!name) return snap(id);
+    if (!p) p = players[id] = { name, state: 'lobby', deck: [], i: 0, score: 0, best: 0, played: false, res: {} }; else p.name = name;
+  } else if (p) {
+    if (b.type === 'start' && (p.state === 'lobby' || p.state === 'end')) { p.deck = mkDeck(); p.perm = p.deck.map(id => { const q = BANK[id]; return q.t === 'choice' ? sh([...q.o.keys()]) : null; }); p.i = 0; p.score = 0; p.res = {}; p.state = 'play'; p.played = true; }
+    else if (b.type === 'submit' && p.state === 'play') {
+      const q = BANK[p.deck[p.i]];
+      const pm = p.perm[p.i]; if (valid(q, b.v)) { const g = pts(q, pm ? pm[b.v] : b.v); p.res[p.i] = { v: b.v, g }; p.score += g; p.state = 'reveal'; }
+    } else if (b.type === 'next' && p.state === 'reveal') {
+      if (p.i + 1 < p.deck.length) { p.i++; p.state = 'play'; } else { p.state = 'end'; p.best = Math.max(p.best, p.score); }
+    }
   }
+  return snap(id);
 }
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml', '.mp4': 'video/mp4', '.webm': 'video/webm' };
 function body(req) {
   return new Promise(r => { let b = ''; req.on('data', d => { b += d; if (b.length > 1e5) req.destroy(); }); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch { r({}); } }); });
-}
-const json = (res, o, code = 200) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-function lanUrls() {
-  const out = [];
-  for (const list of Object.values(os.networkInterfaces())) for (const i of list || []) if (i.family === 'IPv4' && !i.internal) out.push(`http://${i.address}:${PORT}`);
-  return out;
 }
 function sendFile(req, res, f) {   // 支援 Range，讓手機（含 iPhone）能播放 mp4
   fs.stat(f, (e, st) => {
@@ -115,46 +86,18 @@ function sendFile(req, res, f) {   // 支援 Range，讓手機（含 iPhone）�
     }
   });
 }
-
 http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
-  if (req.method === 'GET' && u.pathname === '/events') {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    const c = { id: String(u.searchParams.get('id') || '').slice(0, 40), res };
-    clients.add(c);
-    res.write('data: ' + JSON.stringify(snap(c.id)) + '\n\n');
-    req.on('close', () => clients.delete(c));
-    return;
-  }
-  if (req.method === 'GET' && u.pathname === '/api/info') return json(res, { urls: lanUrls() });
-  if (req.method === 'POST' && u.pathname === '/api/join') {
-    const b = await body(req), name = String(b.name || '').trim().slice(0, 12), id = String(b.id || '').slice(0, 40);
-    if (!name || !id) return json(res, { ok: false }, 400);
-    G.players[id] = G.players[id] || { answers: {} }; G.players[id].name = name;
-    broadcast(); return json(res, { ok: true });
-  }
-  if (req.method === 'POST' && u.pathname === '/api/answer') {
-    const b = await body(req), p = G.players[b.id];
-    if (!p || G.phase !== 'question' || !valid(cur(), b.v)) return json(res, { ok: false }, 400);
-    p.answers[G.q] = b.v; broadcast(); maybeReveal(); return json(res, { ok: true });
-  }
-  if (req.method === 'POST' && u.pathname === '/api/play') {   // 任何已加入的玩家都可以開始／再玩一次
-    const b = await body(req);
-    if (!G.players[b.id] || (G.phase !== 'lobby' && G.phase !== 'end')) return json(res, { ok: false }, 400);
-    const ok = next(); broadcast(); return json(res, { ok });
-  }
-  if (req.method === 'POST' && u.pathname === '/api/host') {
-    const b = await body(req);
-    if (b.key !== KEY) return json(res, { ok: false, error: '主持人金鑰不正確' }, 403);
-    const ok = next(); broadcast(); return json(res, { ok, error: ok ? undefined : '還沒有玩家加入' });
+  if (req.method === 'POST' && u.pathname === '/api/act') {
+    const out = act(await body(req));
+    res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify(out));
   }
   if (req.method === 'GET' && u.pathname.startsWith('/images/')) return sendFile(req, res, path.join(PUB, 'images', path.basename(decodeURIComponent(u.pathname))));
   if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/host')) return sendFile(req, res, path.join(PUB, 'index.html'));
   res.writeHead(404); res.end('Not found');
 }).listen(PORT, () => {
-  console.log('\n英雄聯盟派對答題 已啟動（' + (AUTO ? '自動進行，不需要主持人' : '主持人手動控制') + '）');
-  console.log('  玩家請連： http://localhost:' + PORT + (lanUrls().length ? '  或  ' + lanUrls().join('  或  ') : ''));
-  console.log('  （選用）主持人大螢幕： http://localhost:' + PORT + '/host?key=' + KEY);
+  const lan = []; for (const l of Object.values(os.networkInterfaces())) for (const i of l || []) if (i.family === 'IPv4' && !i.internal) lan.push(`http://${i.address}:${PORT}`);
+  console.log('\n英雄聯盟答題（單人闖關＋排行榜）已啟動');
+  console.log('  開啟： http://localhost:' + PORT + (lan.length ? '  或  ' + lan.join('  或  ') : ''));
   console.log('  題庫：' + BANK.length + ' 題，每場抽 ' + PER + ' 題\n');
 });
-setInterval(() => { for (const c of clients) c.res.write(': ping\n\n'); }, 25000);

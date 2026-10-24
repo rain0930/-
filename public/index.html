@@ -8,23 +8,21 @@
 :root{color-scheme:light dark;--bg:#faf7ff;--fg:#1d1633;--card:#fff;--mut:#6b6485;--ac:#6d4aff;--ok:#16a34a;--bad:#dc2626;--line:#e3dcf5}
 @media (prefers-color-scheme:dark){:root{--bg:#14101f;--fg:#f1edff;--card:#201a33;--mut:#a59fc0;--ac:#9b83ff;--line:#352c52}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Noto Sans TC","PingFang TC",sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Noto Sans TC","PingFang TC",sans-serif;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 #app,#media{max-width:560px;margin:0 auto;padding:0 16px}
 #app{padding-bottom:40px}
-#media:empty+#app{padding-top:20px}
-#media:not(:empty){padding-top:20px}
-body.host #app,body.host #media{max-width:900px;font-size:20px}
-h1{font-size:28px;margin:8px 0 4px}h2{font-size:24px;margin:12px 0}
-body.host h2{font-size:34px}
-.mut{color:var(--mut);font-size:14px}body.host .mut{font-size:17px}
+#media:not(:empty),#media:empty+#app{padding-top:20px}
+h1{font-size:26px;margin:8px 0 4px}h2{font-size:22px;margin:12px 0}
+.mut{color:var(--mut);font-size:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
-.card.ok{border-color:var(--ok)}
+.card.ok{border-color:var(--ok)}.card.bad{border-color:var(--bad)}
 button,input{font:inherit;border-radius:12px;border:1px solid var(--line);padding:12px 14px;background:var(--card);color:var(--fg);width:100%;margin:6px 0}
 button{cursor:pointer;text-align:left}
 button.main{background:var(--ac);color:#fff;border:0;text-align:center;font-weight:600}
+button.pick,.opt.pick{border:2px solid var(--ac)}
 .opt{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--card);margin:6px 0}
-button.pick,.opt.pick{border:2px solid var(--ac)}.opt.ok{border:2px solid var(--ok);background:color-mix(in srgb,var(--ok) 15%,var(--card))}.opt.bad{border:2px solid var(--bad)}
-button:disabled{opacity:.6;cursor:default}
+.opt.ok{border:2px solid var(--ok);background:color-mix(in srgb,var(--ok) 15%,var(--card))}.opt.bad{border:2px solid var(--bad)}
+button:disabled{opacity:.5;cursor:default}
 .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}.row:last-child{border:0}
 .me{color:var(--ac);font-weight:700}
 .qimg{max-width:100%;max-height:320px;border-radius:12px;margin:8px 0;display:block}
@@ -34,74 +32,64 @@ button:disabled{opacity:.6;cursor:default}
 <div id="media"></div>
 <div id="app"><p class="mut">連線中⋯</p></div>
 <script>
-const host=location.pathname==="/host",key=new URLSearchParams(location.search).get("key")||"";
-if(host)document.body.classList.add("host");
-let uid=localStorage.getItem("uid");if(!uid){uid=Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem("uid",uid)}
-const TYPE={choice:"選擇題",tf:"是非題",text:"填空題",order:"排序題",num:"猜數字",img:"圖片題",video:"影片題"};
-let S=null,recv=0,draft=[],lastKey="",mediaKey="",urls=[];
+window.onerror=(m,u,l)=>{const a=document.getElementById("app");if(a)a.innerHTML='<h2>頁面發生錯誤</h2><p class="mut">請截圖這段文字給開發者：<br>'+String(m)+" (行 "+l+")</p>"};
+let uid=null;try{uid=localStorage.getItem("uid")}catch(e){}
+if(!uid){uid=Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem("uid",uid)}catch(e){}}
+const TYPE={choice:"選擇題",tf:"是非題",text:"填空題",order:"排序題",num:"猜數字"};
+let S=null,sel,draft=[],lastKey="",mediaKey="";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const post=(u,b)=>fetch(u,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json()).catch(()=>({ok:false}));
-if(host)fetch("/api/info").then(r=>r.json()).then(d=>{urls=d.urls;render()});
-const es=new EventSource("/events?id="+uid);
-es.onmessage=e=>{S=JSON.parse(e.data);recv=Date.now();render()};
-setInterval(tick,500);
-function tick(){const el=$("#cd");if(!el)return;if(!S||!S.left){el.textContent="";return}const s=Math.max(0,Math.ceil((S.left-(Date.now()-recv))/1000));el.textContent=S.phase==="question"?"· 剩 "+s+" 秒":"· "+s+" 秒後下一題"}
-function mediaHtml(q){let h=`<p class="mut"><span id="mt"></span> <span id="cd"></span></p><h2>${esc(q.q)}</h2>`;
+async function act(type,extra){
+  try{const r=await fetch("/api/act",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({id:uid,type,...extra})});S=await r.json();render()}
+  catch(e){if(!S)$("#app").innerHTML='<p class="mut">連線失敗（伺服器可能在休眠，請等 30 秒後重新整理）。<br>'+esc(e&&e.message||e)+'</p>'}}
+act("state");
+setInterval(()=>{if(S&&(S.state==="lobby"||S.state==="end"||S.state==="new")&&!(document.activeElement&&document.activeElement.tagName==="INPUT"))act("state")},6000);
+function mediaHtml(q){let h=`<p class="mut" id="mt"></p><h2>${esc(q.q)}</h2>`;
   if(q.img)h+=`<img class="qimg" src="/images/${encodeURIComponent(q.img)}" alt="">`;
   if(q.video)h+=`<video class="qimg" src="/images/${encodeURIComponent(q.video)}" controls playsinline preload="auto"></video>`;
   if(q.yt)h+=`<iframe class="qimg" style="width:100%;aspect-ratio:16/9;border:0" src="https://www.youtube.com/embed/${encodeURIComponent(q.yt)}?playsinline=1&rel=0" allow="encrypted-media; fullscreen" allowfullscreen></iframe>`;
   return h}
-es.onerror=()=>{if(!S)$("#app").innerHTML='<p class="mut">連線失敗，請確認伺服器已啟動。</p>'};
-function boardHtml(n){return `<div class="card">${(S.board||[]).slice(0,n).map((p,i)=>`<div class="row"><span class="${p.id===uid?"me":""}">${i+1}. ${esc(p.name)}</span><b>${p.s}</b></div>`).join("")||'<span class="mut">還沒有玩家</span>'}</div>`}
-const ctl=l=>host?`<button class="main" onclick="act()">${l}</button>`:"";
-const play=l=>!host&&S.joined?`<button class="main" onclick="doPlay()">${l}</button>`:"";
-function body(q,rev){const dis=host||!S.joined||rev;let h="";
-  if(q.t==="choice"||q.t==="tf"){q.o.forEach((o,i)=>{let c="opt";if(rev){if(i===S.answer)c+=" ok";else if(S.mine===i)c+=" bad"}else if(S.mine===i)c+=" pick";
-    h+=dis?`<div class="${c}">${q.t==="tf"?"":"ABCD"[i]+". "}${esc(o)}</div>`:`<button class="${c}" onclick="send(${i})">${q.t==="tf"?"":"ABCD"[i]+". "}${esc(o)}</button>`})}
+function boardHtml(){const b=S.board||{top:[]};return `<h2>排行榜（最佳成績）</h2><div class="card">${b.top.map((p,i)=>`<div class="row"><span class="${p.me?"me":""}">${i+1}. ${esc(p.name)}</span><b>${p.s}</b></div>`).join("")||'<span class="mut">還沒有人完成，你可以當第一名！</span>'}</div>${b.playing?`<p class="mut">目前有 ${b.playing} 人正在挑戰</p>`:""}`}
+function body(q,rev){let h="";
+  if(q.t==="choice"||q.t==="tf"){q.o.forEach((o,i)=>{let c="opt",pre=q.t==="tf"?"":"ABCD"[i]+". ";
+    if(rev){if(i===S.answer)c+=" ok";else if(S.mine===i)c+=" bad";h+=`<div class="${c}">${pre}${esc(o)}</div>`}
+    else{if(sel===i)c+=" pick";h+=`<button class="${c}" onclick="sel=${i};render()">${pre}${esc(o)}</button>`}})}
   else if(q.t==="text"||q.t==="num"){
-    if(!dis)h=`<input id="tx" ${q.t==="num"?'inputmode="numeric"':""} value="${S.mine!==undefined?esc(S.mine):""}" placeholder="輸入答案"><button class="main" onclick="sendTx()">送出</button>`;
-    else if(host&&!rev)h='<p class="mut">玩家作答中⋯</p>';
-    if(rev)h+=`<div class="card ok">正確答案：<b>${esc(S.answer)}</b>${!host&&S.mine!==undefined?`（你的答案：${esc(S.mine)}）`:""}</div>`}
-  else if(q.t==="order"){
-    if(host&&!rev)h=`<div class="card">${q.show.map(esc).join("、")}</div><p class="mut">玩家要依序點選，由低到高</p>`;
-    else if(!host){const cur=rev?(S.mine||[]):draft;
-      h=`<p class="mut">${rev?"你的順序":"依序點選，由低到高"}</p><div class="card">${cur.map((x,i)=>`${i+1}. ${esc(x)}`).join("<br>")||'<span class="mut">尚未選擇</span>'}</div>`;
-      if(!rev&&S.joined)h+=q.show.filter(x=>!draft.includes(x)).map(x=>`<button onclick="pick(this.dataset.v)" data-v="${esc(x)}">${esc(x)}</button>`).join("")+`<button onclick="draft=[];render()">重選</button><button class="main" ${draft.length<q.show.length?"disabled":""} onclick="send([...draft])">送出</button>`}
-    if(rev)h+=`<div class="card ok">正確順序：<b>${S.answer.map(esc).join(" → ")}</b></div>`}
+    if(!rev)h=`<input id="tx" ${q.t==="num"?'inputmode="numeric"':""} placeholder="輸入答案">`;
+    else h=`<div class="card">你的答案：<b>${esc(S.mine)}</b></div><div class="card ok">正確答案：<b>${esc(S.answer)}</b></div>`}
+  else if(q.t==="order"){const cur=rev?S.mine:draft;
+    h=`<p class="mut">${rev?"你的順序":"依序點選，由弱／低到強／高"}</p><div class="card">${cur.map((x,i)=>`${i+1}. ${esc(x)}`).join("<br>")||'<span class="mut">尚未選擇</span>'}</div>`;
+    if(!rev)h+=q.show.filter(x=>!draft.includes(x)).map(x=>`<button data-v="${esc(x)}" onclick="draft=[...draft,this.dataset.v];render()">${esc(x)}</button>`).join("")+`<button onclick="draft=[];render()">重選</button>`;
+    else h+=`<div class="card ok">正確順序：<b>${S.answer.map(esc).join(" → ")}</b></div>`}
   return h}
 function render(){
   if(!S)return;
-  const k=S.phase+S.q;
-  if(k!==lastKey){lastKey=k;draft=Array.isArray(S.mine)?[...S.mine]:[]}
-  else if(document.activeElement&&document.activeElement.tagName==="INPUT")return;
-  const q=S.question;let h="";
-  const mk=q?S.q+"|"+q.q:"";
+  const q=S.question,k=S.state+S.i;
+  if(k!==lastKey){lastKey=k;sel=undefined;draft=[]}
+  const mk=q?S.i+"|"+q.q:"";
   if(mk!==mediaKey){mediaKey=mk;$("#media").innerHTML=q?mediaHtml(q):""}
-  if(q){$("#mt").textContent=`第 ${S.q+1} / ${S.total} 題 · ${TYPE[q.img?"img":q.video||q.yt?"video":q.t]}${q.c==="a"?" · ARAM":""}${host?` · 已作答 ${S.answered} / ${S.n}`:""}`;tick()}
-  if(S.phase==="lobby"){
-    h=`<h1>⚔️ 召喚峽谷大挑戰</h1><p class="mut">目前 ${S.n} 位玩家</p>`;
-    if(host)h+=`<div class="card">請玩家用手機開啟：<br><b>${(/^(localhost|127\.|192\.168\.|10\.|172\.)/.test(location.hostname)&&urls.length?urls:[location.origin]).map(esc).join("<br>")}</b></div>`;
-    else if(!S.joined)h+=`<div class="card"><input id="nm" maxlength="12" placeholder="輸入你的暱稱"><button class="main" onclick="join()">加入遊戲</button></div>`;
-    else h+=`<div class="card">你已加入！等朋友都進來後，任何人都可以按下面的按鈕開始。</div>`;
-    h+=`<div class="card">${(S.board||[]).map(p=>esc(p.name)).join("、")||'<span class="mut">還沒有玩家</span>'}</div>`+play("開始遊戲（隨機抽題）")+ctl("開始遊戲（隨機抽題）");
+  let h="";
+  if(S.state==="new"){
+    h=`<h1>⚔️ 召喚峽谷大挑戰</h1><p class="mut">自己的步調，答完比排行榜</p><div class="card"><input id="nm" maxlength="12" placeholder="輸入你的暱稱"><button class="main" onclick="join()">加入</button></div>`+boardHtml();
+  }else if(S.state==="lobby"){
+    h=`<h1>嗨，${esc(S.name)}！</h1><p class="mut">每場隨機抽 ${S.total||"10"} 題左右，沒有時間限制。</p><button class="main" onclick="act('start')">開始挑戰</button>`+boardHtml();
   }else if(q){
-    const rev=S.phase==="reveal";
-    h+=body(q,rev);
-    if(!host&&!S.joined)h+='<p class="mut">你還沒加入這一局，只能觀戰。</p>';
-    else if(!host&&!rev&&S.mine!==undefined)h+='<p class="mut">已送出，公布答案前都可以修改。</p>';
-    if(!host&&rev&&S.joined)h+=`<div class="card ok">本題得分：<b>${S.gain}</b></div>`;
-    if(rev)h+="<h2>排行榜</h2>"+boardHtml(10);
-    h+=ctl(rev?(S.q+1<S.total?"跳到下一題":"看最終結果"):"提前公布答案");
-  }else h="<h1>🏆 最終結果</h1>"+boardHtml(30)+play("再玩一次（重新抽題）")+ctl("重新開始（重新抽題）");
+    $("#mt").textContent=`第 ${S.i+1} / ${S.total} 題 · ${TYPE[q.t]}${q.c==="a"?" · ARAM":""}${q.c==="k"?" · 英雄技能":""} · 目前 ${S.score} 分`;
+    const rev=S.state==="reveal";h=body(q,rev);
+    if(!rev){const ready=q.t==="choice"||q.t==="tf"?sel!==undefined:q.t==="order"?draft.length===q.show.length:true;
+      h+=`<button class="main" ${ready?"":"disabled"} onclick="submit()">送出</button>`}
+    else{h+=`<div class="card ${S.gain>0?"ok":"bad"}">${S.gain>=1000?"✅ 答對了！":S.gain>0?"👍 接近了！":"❌ 答錯了"} <b>+${S.gain}</b>${S.exp?`<br><span class="mut">${esc(S.exp)}</span>`:""}</div>`+
+      `<button class="main" onclick="act('next')">${S.i+1<S.total?"下一題":"看結果"}</button>`}
+  }else{
+    h=`<h1>🏆 完成！</h1><div class="card">本次分數：<b>${S.score}</b> / ${S.total*1000}<br><span class="mut">最佳成績：${S.best}</span></div><button class="main" onclick="act('start')">再玩一次（重新抽題）</button>`+boardHtml();
+  }
   $("#app").innerHTML=h;
 }
-async function join(){const v=$("#nm").value.trim();if(v)await post("/api/join",{id:uid,name:v})}
-function send(v){post("/api/answer",{id:uid,v})}
-function sendTx(){const el=$("#tx"),v=el.value.trim();if(!v)return;el.blur();if(S.question.t==="num"){const n=Number(v);if(isNaN(n))return;send(n)}else send(v)}
-function pick(x){draft=[...draft,x];render()}
-async function doPlay(){const r=await post("/api/play",{id:uid});if(!r.ok)alert("目前無法開始")}
-async function act(){const r=await post("/api/host",{key});if(!r.ok)alert(r.error||"操作失敗")}
+function join(){const v=$("#nm").value.trim();if(v)act("join",{name:v})}
+function submit(){const q=S.question;let v;
+  if(q.t==="choice"||q.t==="tf")v=sel;else if(q.t==="order")v=[...draft];
+  else{const t=$("#tx").value.trim();if(!t)return;v=q.t==="num"?Number(t):t;if(q.t==="num"&&isNaN(v)){alert("請輸入數字");return}}
+  act("submit",{v})}
 </script>
 </body>
 </html>
