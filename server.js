@@ -3,20 +3,25 @@ const http = require('http'), fs = require('fs'), path = require('path'), os = r
 const PORT = +process.env.PORT || 3000;
 const PER = +process.env.PER || 8;          // 每場題數
 const ARAM_N = +process.env.ARAM_N || 2;    // 每場 ARAM 題數
-const IMG_N = +process.env.IMG_N || 2;      // 每場最多圖片題數
+const IMG_N = +process.env.IMG_N || 2;      // 每場最多圖片／影片題數
+const AUTO = process.env.AUTO !== '0';      // 自動進行（不需要主持人）；設 AUTO=0 則全部由主持人手動控制
+const QTIME = (+process.env.QTIME || 25) * 1000;  // 每題作答秒數
+const RTIME = (+process.env.RTIME || 7) * 1000;   // 公布答案後停留秒數
 const KEY = process.env.HOST_KEY || crypto.randomBytes(3).toString('hex');
 const PUB = path.join(__dirname, 'public');
 const BANK = JSON.parse(fs.readFileSync(path.join(__dirname, 'questions.json'), 'utf8')).map((q, i) => ({ id: i, ...q }));
+const isMedia = b => b.img || b.video || b.yt;
 
-let G = { phase: 'lobby', q: -1, deck: [], players: {} };
+let G = { phase: 'lobby', q: -1, deck: [], players: {}, deadline: 0 };
+let tm = null;
 const clients = new Set();
 
 const sh = a => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(x => x[1]);
 function mkDeck() {
-  const img = sh(BANK.filter(b => b.img)).slice(0, IMG_N);
-  const aram = sh(BANK.filter(b => b.c === 'a' && !b.img)).slice(0, ARAM_N);
-  const rest = sh(BANK.filter(b => b.c !== 'a' && !b.img)).slice(0, Math.max(0, PER - img.length - aram.length));
-  return sh([...img, ...aram, ...rest]).map(b => b.id);
+  const med = sh(BANK.filter(isMedia)).slice(0, IMG_N);
+  const aram = sh(BANK.filter(b => b.c === 'a' && !isMedia(b))).slice(0, ARAM_N);
+  const rest = sh(BANK.filter(b => b.c !== 'a' && !isMedia(b))).slice(0, Math.max(0, PER - med.length - aram.length));
+  return sh([...med, ...aram, ...rest]).map(b => b.id);
 }
 const cur = () => BANK[G.deck[G.q]];
 const norm = s => String(s).trim().toLowerCase().replace(/\s+/g, '');
@@ -42,10 +47,10 @@ const board = () => Object.entries(G.players).map(([id, p]) => ({ id, name: p.na
 
 function snap(id) {
   const me = G.players[id];
-  const o = { phase: G.phase, q: G.q, total: G.deck.length, n: Object.keys(G.players).length, joined: !!me };
+  const o = { phase: G.phase, q: G.q, total: G.deck.length, n: Object.keys(G.players).length, joined: !!me, auto: AUTO, left: G.deadline ? Math.max(0, G.deadline - Date.now()) : 0 };
   if (G.phase === 'question' || G.phase === 'reveal') {
     const q = cur(), rev = G.phase === 'reveal';
-    o.question = { t: q.t, q: q.q, o: q.o, img: q.img, show: q.show, c: q.c };
+    o.question = { t: q.t, q: q.q, o: q.o, img: q.img, video: q.video, yt: q.yt, show: q.show, c: q.c };
     o.answered = Object.values(G.players).filter(p => p.answers[G.q] !== undefined).length;
     if (me) o.mine = me.answers[G.q];
     if (rev) { o.answer = q.t === 'text' ? q.a[0] : q.a; if (me) o.gain = pts(q, me.answers[G.q]); }
@@ -53,18 +58,38 @@ function snap(id) {
   if (G.phase !== 'question') o.board = board();
   return o;
 }
-function broadcast() {
-  for (const c of clients) c.res.write('data: ' + JSON.stringify(snap(c.id)) + '\n\n');
+function broadcast() { for (const c of clients) c.res.write('data: ' + JSON.stringify(snap(c.id)) + '\n\n'); }
+
+function schedule() {
+  clearTimeout(tm); G.deadline = 0;
+  if (!AUTO) return;
+  let ms = 0;
+  if (G.phase === 'question') { const q = cur(); ms = q.time ? q.time * 1000 : (q.video || q.yt) ? 45000 : QTIME; }
+  else if (G.phase === 'reveal') ms = RTIME;
+  if (!ms) return;
+  G.deadline = Date.now() + ms;
+  tm = setTimeout(() => { next(); broadcast(); }, ms);
 }
 function next() {
   if (G.phase === 'lobby') { if (!Object.keys(G.players).length) return false; G.deck = mkDeck(); G.q = 0; G.phase = 'question'; }
   else if (G.phase === 'question') G.phase = 'reveal';
   else if (G.phase === 'reveal') { if (G.q + 1 < G.deck.length) { G.q++; G.phase = 'question'; } else G.phase = 'end'; }
   else { for (const p of Object.values(G.players)) p.answers = {}; G.phase = 'lobby'; G.q = -1; G.deck = []; }
+  schedule();
   return true;
 }
+// 所有「在線」玩家都答完 → 提早公布答案
+function maybeReveal() {
+  if (!AUTO || G.phase !== 'question') return;
+  const online = new Set([...clients].map(c => c.id));
+  const ps = Object.entries(G.players).filter(([id]) => online.has(id));
+  if (ps.length && ps.every(([, p]) => p.answers[G.q] !== undefined)) {
+    clearTimeout(tm); G.deadline = Date.now() + 800;
+    tm = setTimeout(() => { if (G.phase === 'question') { next(); broadcast(); } }, 800);
+  }
+}
 
-const TYPES = { '.html': 'text/html; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml' };
+const TYPES = { '.html': 'text/html; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml', '.mp4': 'video/mp4', '.webm': 'video/webm' };
 function body(req) {
   return new Promise(r => { let b = ''; req.on('data', d => { b += d; if (b.length > 1e5) req.destroy(); }); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch { r({}); } }); });
 }
@@ -73,6 +98,22 @@ function lanUrls() {
   const out = [];
   for (const list of Object.values(os.networkInterfaces())) for (const i of list || []) if (i.family === 'IPv4' && !i.internal) out.push(`http://${i.address}:${PORT}`);
   return out;
+}
+function sendFile(req, res, f) {   // 支援 Range，讓手機（含 iPhone）能播放 mp4
+  fs.stat(f, (e, st) => {
+    if (e || !st.isFile()) { res.writeHead(404); return res.end(); }
+    const type = TYPES[path.extname(f).toLowerCase()] || 'application/octet-stream', r = req.headers.range;
+    if (r) {
+      const m = /bytes=(\d*)-(\d*)/.exec(r) || [];
+      const s = m[1] ? +m[1] : 0, en = Math.min(m[2] ? +m[2] : st.size - 1, st.size - 1);
+      if (s > en) { res.writeHead(416); return res.end(); }
+      res.writeHead(206, { 'content-type': type, 'content-range': `bytes ${s}-${en}/${st.size}`, 'accept-ranges': 'bytes', 'content-length': en - s + 1 });
+      fs.createReadStream(f, { start: s, end: en }).pipe(res);
+    } else {
+      res.writeHead(200, { 'content-type': type, 'accept-ranges': 'bytes', 'content-length': st.size });
+      fs.createReadStream(f).pipe(res);
+    }
+  });
 }
 
 http.createServer(async (req, res) => {
@@ -95,25 +136,25 @@ http.createServer(async (req, res) => {
   if (req.method === 'POST' && u.pathname === '/api/answer') {
     const b = await body(req), p = G.players[b.id];
     if (!p || G.phase !== 'question' || !valid(cur(), b.v)) return json(res, { ok: false }, 400);
-    p.answers[G.q] = b.v; broadcast(); return json(res, { ok: true });
+    p.answers[G.q] = b.v; broadcast(); maybeReveal(); return json(res, { ok: true });
+  }
+  if (req.method === 'POST' && u.pathname === '/api/play') {   // 任何已加入的玩家都可以開始／再玩一次
+    const b = await body(req);
+    if (!G.players[b.id] || (G.phase !== 'lobby' && G.phase !== 'end')) return json(res, { ok: false }, 400);
+    const ok = next(); broadcast(); return json(res, { ok });
   }
   if (req.method === 'POST' && u.pathname === '/api/host') {
     const b = await body(req);
     if (b.key !== KEY) return json(res, { ok: false, error: '主持人金鑰不正確' }, 403);
     const ok = next(); broadcast(); return json(res, { ok, error: ok ? undefined : '還沒有玩家加入' });
   }
-  if (req.method === 'GET' && u.pathname.startsWith('/images/')) {
-    const f = path.join(PUB, 'images', path.basename(decodeURIComponent(u.pathname)));
-    return fs.readFile(f, (e, d) => { if (e) { res.writeHead(404); return res.end(); } res.writeHead(200, { 'content-type': TYPES[path.extname(f).toLowerCase()] || 'application/octet-stream' }); res.end(d); });
-  }
-  if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/host')) {
-    return fs.readFile(path.join(PUB, 'index.html'), (e, d) => { res.writeHead(200, { 'content-type': TYPES['.html'] }); res.end(d); });
-  }
+  if (req.method === 'GET' && u.pathname.startsWith('/images/')) return sendFile(req, res, path.join(PUB, 'images', path.basename(decodeURIComponent(u.pathname))));
+  if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/host')) return sendFile(req, res, path.join(PUB, 'index.html'));
   res.writeHead(404); res.end('Not found');
 }).listen(PORT, () => {
-  console.log('\n英雄聯盟派對答題 已啟動');
-  console.log('  主持人（大螢幕）： http://localhost:' + PORT + '/host?key=' + KEY);
-  const l = lanUrls(); console.log('  玩家（手機）請連： ' + (l.join('  或  ') || 'http://localhost:' + PORT));
+  console.log('\n英雄聯盟派對答題 已啟動（' + (AUTO ? '自動進行，不需要主持人' : '主持人手動控制') + '）');
+  console.log('  玩家請連： http://localhost:' + PORT + (lanUrls().length ? '  或  ' + lanUrls().join('  或  ') : ''));
+  console.log('  （選用）主持人大螢幕： http://localhost:' + PORT + '/host?key=' + KEY);
   console.log('  題庫：' + BANK.length + ' 題，每場抽 ' + PER + ' 題\n');
 });
 setInterval(() => { for (const c of clients) c.res.write(': ping\n\n'); }, 25000);
