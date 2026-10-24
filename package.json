@@ -1,0 +1,6 @@
+{
+  "name": "lol-party-quiz",
+  "version": "1.0.0",
+  "description": "英雄聯盟派對答題（零依賴，Node.js 18+）",
+  "scripts": { "start": "node server.js" }
+}
